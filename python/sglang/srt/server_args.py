@@ -378,7 +378,7 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
-    enable_flashinfer_autotune: bool = False
+    enable_flashinfer_autotune: bool = True
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
