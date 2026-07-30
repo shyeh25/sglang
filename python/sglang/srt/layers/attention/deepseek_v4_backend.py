@@ -1797,6 +1797,7 @@ class DeepseekV4AttnBackend(
                     layer=layer,
                     compress_ratio=compress_ratio,
                     forward_batch=forward_batch,
+                    core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                     swa_page_indices=swa_page_indices,
                     extra_indices=extra_indices,
@@ -2022,6 +2023,7 @@ class DeepseekV4AttnBackend(
         layer: RadixAttention,
         compress_ratio: Literal[0, 4, 128],
         forward_batch: ForwardBatch,
+        core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
         swa_page_indices: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
@@ -2060,9 +2062,13 @@ class DeepseekV4AttnBackend(
         assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
         cum_seq_lens_q = self._move_to_device(cum_lens)
 
-        # Per-request TOTAL KV length (cached prefix + extend tokens).
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        assert seq_lens.shape == (batch_size,), f"{seq_lens.shape=} {batch_size=}"
+        # PER-TOKEN causal KV length. In the dense (non-varlen) shape below each
+        # query token is its own batch entry, so seq_lens must be per token, not
+        # per request. seq_lens_casual is exactly that: the metadata builder
+        # derives swa_topk_lengths = clamp(seq_lens_casual, max=SWA_WINDOW) and
+        # build_causal_swa_page_indices uses pos_causal = seq_lens_casual - 1.
+        seq_lens = core_attn_metadata.seq_lens_casual[:sum_q].to(torch.int32)
+        assert seq_lens.shape == (sum_q,), f"{seq_lens.shape=} {sum_q=}"
 
         # Combined per-token sparse table (physical indices, -1 invalid).
         swa_indices = swa_page_indices[:sum_q]
@@ -2091,7 +2097,9 @@ class DeepseekV4AttnBackend(
 
         # FP8 query: RoPE already applied upstream; per-tensor scale 1.0 makes
         # quantization a plain e4m3 cast (same recipe as the decode branch).
-        q_fp8 = q[:sum_q].to(torch.float8_e4m3fn)
+        # Reshaped to the DENSE layout [batch, q_len_per_request, heads, 512]
+        # with one query token per batch entry.
+        q_fp8 = q[:sum_q].to(torch.float8_e4m3fn).view(sum_q, 1, num_heads, 512)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
@@ -2113,7 +2121,37 @@ class DeepseekV4AttnBackend(
             )
             out_arg = out_padded[:sum_q]
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
+        # ------------------------------------------------------------------
+        # FIX (per-token variant): drive the kernel in its DENSE shape with one
+        # query token per batch entry, instead of one varlen call over the whole
+        # prefill batch.
+        #
+        # Why this is immune to the fault: the launcher's varlen branch accepts
+        # non-uniform q lengths, but the grid is rectangular
+        # (numCtasX = ceil(mMaxSeqLenQ / mStepQ), numCtasZ = mBatchSize), so a
+        # short request in a batch whose max_q_len is much larger overruns the
+        # flattened sparse_indices / sparseMlaTopKLens arrays -- and sparse MLA
+        # sets the K TMA extent to INT_MAX, so there is no clamp. With
+        # q_len_per_request == 1 the identity sum_q == batch_size * max_q_len
+        # holds by construction and no CTA can run past its token.
+        #
+        # This is also how FlashMLA does prefill: both of its paths are
+        # per-token (flash_mla_with_kvcache gets q.unsqueeze(1) with per-token
+        # indices/topk_length; flash_mla_sparse_fwd gets [s_q, h_q, d] with
+        # per-query rebased indices). The DSv4 trtllm DECODE call site in this
+        # same file already uses this dense shape too -- unchanged by this patch.
+        #
+        # Trade-off vs the varlen shape: the kernel can no longer tile several
+        # query tokens into one CTA, so this is a throughput question, not a
+        # correctness one. Measure before preferring it.
+        if out_padded is None:
+            out_padded = torch.zeros(
+                (num_qo_padded, num_heads, 512),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+        del out_arg, cum_seq_lens_q, max_q_len  # not used in the dense shape
+        trtllm_batch_decode_sparse_mla_dsv4(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
@@ -2121,15 +2159,13 @@ class DeepseekV4AttnBackend(
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,
             seq_lens=seq_lens,
-            out=out_arg,
+            out=out_padded[:sum_q].view(sum_q, 1, num_heads, 512),
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
-            cum_seq_lens_q=cum_seq_lens_q,
-            max_q_len=max_q_len,
         )
-        return out_padded if out_padded is not None else out
+        return out_padded
 
     def _forward_prefill_sparse(
         self,
