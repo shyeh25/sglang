@@ -1085,6 +1085,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        self._owned_moe_runner: Optional[MoeRunner] = None
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -2144,11 +2145,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        # self.runner's presence is load-bearing for FusedMoE's ownership
+        # detection elsewhere; gate on _owned_moe_runner instead.
+        owned_runner = self._owned_moe_runner
+        if owned_runner is not None and (
+            owned_runner.runner_backend.is_flashinfer_trtllm()
+            or owned_runner.runner_backend.is_flashinfer_trtllm_routed()
         ):
-            self._prepare_flashinfer_trtllm_activation_params(layer)
+            self._prepare_flashinfer_trtllm_activation_params(
+                layer, owned_runner.config
+            )
 
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
@@ -2156,14 +2162,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
-    def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
+    def _prepare_flashinfer_trtllm_activation_params(
+        self, layer: Module, moe_runner_config: MoeRunnerConfig
+    ) -> None:
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
         num_experts = int(layer.num_local_experts)
         device = layer.w13_weight.device
         for name, value in (
-            ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
-            ("gemm1_beta", self.moe_runner_config.gemm1_beta),
-            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+            ("gemm1_alpha", moe_runner_config.gemm1_alpha),
+            ("gemm1_beta", moe_runner_config.gemm1_beta),
+            ("gemm1_clamp_limit", moe_runner_config.gemm1_clamp_limit),
         ):
             tensor = (
                 None
@@ -2349,6 +2357,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self._owned_moe_runner = self.runner
         else:
             # TODO(cwan): refactor other backends
             pass
