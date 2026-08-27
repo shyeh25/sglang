@@ -577,15 +577,35 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA varlen prefill: the decode kernel driven with
-        multi-token queries (``cum_seq_lens_q``/``max_q_len``).
+        """Sparse MLA prefill, driven in the DENSE per-token shape (one query
+        token per batch entry), NOT the varlen (``cum_seq_lens_q``/
+        ``max_q_len``) shape.
+
+        FIX (ported from shyeh25/sglang@197ab370b1e70b6806b6c4fecfc0493b6a14b710,
+        2026-08-27): the varlen launcher accepts non-uniform q lengths but
+        uses a rectangular CTA grid (numCtasX = ceil(mMaxSeqLenQ / mStepQ),
+        numCtasZ = mBatchSize) and sets the sparse-MLA K TMA extent to
+        INT_MAX with no clamp -- so a short request in a batch whose
+        max_q_len is much larger can have its CTA overrun the flattened
+        sparse_indices/sparseMlaTopKLens arrays (an out-of-bounds GPU memory
+        write). This is a plausible root cause of an illegal-memory-access
+        crash observed later in the same forward pass, in an unrelated
+        fp8_wo_a quantization kernel on a subsequent layer (CUDA errors can
+        surface asynchronously at a later kernel launch than the one that
+        actually corrupted memory). With q_len_per_request == 1 the identity
+        sum_q == batch_size * max_q_len holds by construction, so no CTA can
+        run past its own token -- this is also how _forward_trtllm_decode's
+        q_len_uniform==1 branch already calls this same kernel, in this same
+        file. Trade-off: the kernel can no longer tile several query tokens
+        into one CTA (a throughput cost, not a correctness one).
 
         The sparse table has one row per query token: the token's own causal
         SWA window in columns ``[0:128)`` and its compressed tier after.
-        ``seq_lens`` must be the per-request TOTAL KV length including any
-        cached prefix (chunked prefill / cache-hit extends); the kernel
-        derives each token's causal SWA validity from it, so no masks are
-        built here. Runs eagerly, so per-call allocations are fine.
+        ``seq_lens`` here is the PER-TOKEN causal KV length
+        (``core.seq_lens_casual``), not per-request -- required because each
+        query token is now its own dense batch entry (same convention
+        ``_forward_trtllm_decode`` uses for target-verify/draft-extend).
+        Runs eagerly, so per-call allocations are fine.
         """
 
         from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
@@ -594,33 +614,26 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         num_qo_padded, num_heads, head_dim = q.shape
         assert head_dim == 512
 
-        # Varlen query structure, from the same host-side extend lens that
-        # produced this metadata (init_forward_metadata_prefill /
+        # Dense per-token query structure, from the same host-side extend
+        # lens that produced this metadata (init_forward_metadata_prefill /
         # expand_prefill_casually).
         core = self.forward_metadata.core_attn_metadata
         if core.trtllm_prefill_qmeta is None:
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
-            batch_size = len(extend_seq_lens_cpu)
-            cum_lens = [0] * (batch_size + 1)
-            for i, extend_len in enumerate(extend_seq_lens_cpu):
-                cum_lens[i + 1] = cum_lens[i] + int(extend_len)
-            sum_q = cum_lens[-1]
-            max_q_len = max(int(x) for x in extend_seq_lens_cpu)
+            sum_q = sum(int(x) for x in extend_seq_lens_cpu)
             # q (and the per-token metadata rows, via match_num_queries) may
             # be padded past the real extend tokens; the pad rows sit at the
             # end.
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            # Per-request TOTAL KV length (cached prefix + extend tokens).
-            seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
-            assert seq_lens_i32.shape == (batch_size,), f"{seq_lens_i32.shape=}"
-            core.trtllm_prefill_qmeta = (
-                self._move_to_device(cum_lens),
-                max_q_len,
-                sum_q,
-                seq_lens_i32,
-            )
-        cum_seq_lens_q, max_q_len, sum_q, seq_lens = core.trtllm_prefill_qmeta
+            # PER-TOKEN causal KV length -- core.seq_lens_casual is built by
+            # expand_prefill_casually (init_forward_metadata_prefill) as
+            # exactly this: prefix_len + position-within-extend, per query
+            # token, padded with fill=1 past the real tokens.
+            seq_lens_i32 = core.seq_lens_casual[:sum_q].to(torch.int32)
+            assert seq_lens_i32.shape == (sum_q,), f"{seq_lens_i32.shape=} {sum_q=}"
+            core.trtllm_prefill_qmeta = (sum_q, seq_lens_i32)
+        sum_q, seq_lens = core.trtllm_prefill_qmeta
 
         # Combined per-token sparse table (physical indices, -1 invalid).
         # Layer-invariant parts are cached per chunk on the metadata: the c0
@@ -694,9 +707,12 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # FP8 query: RoPE already applied upstream; the fused q norm+rope
         # kernel usually stores e4m3 directly (see _compute_q_b), otherwise
         # the per-tensor-scale-1.0 quantization is a plain e4m3 cast.
+        # Reshaped to the DENSE layout [sum_q, 1, num_heads, 512] -- one
+        # query token per batch entry (see the FIX note in the docstring).
         q_fp8 = q[:sum_q]
         if q_fp8.dtype != torch.float8_e4m3fn:
             q_fp8 = q_fp8.to(torch.float8_e4m3fn)
+        q_fp8 = q_fp8.view(sum_q, 1, num_heads, 512)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
@@ -705,20 +721,17 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
 
-        out_padded = None
-        out_arg = None
-        if num_qo_padded != sum_q:
-            # Padded prefill: run the kernel over the real tokens only and
-            # zero the pad rows (their outputs are discarded downstream, but
-            # keep them finite so nothing NaN-propagates).
-            out_padded = torch.zeros(
-                (num_qo_padded, num_heads, 512),
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
-            out_arg = out_padded[:sum_q]
+        # Dense per-token call always needs a full [num_qo_padded, ...]
+        # output buffer to view(sum_q, 1, ...) into, whether or not q itself
+        # is padded (pad rows are discarded downstream; zero-filled so
+        # nothing NaN-propagates).
+        out_padded = torch.zeros(
+            (num_qo_padded, num_heads, 512),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
+        trtllm_batch_decode_sparse_mla_dsv4(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
@@ -726,15 +739,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,
             seq_lens=seq_lens,
-            out=out_arg,
+            out=out_padded[:sum_q].view(sum_q, 1, num_heads, 512),
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
-            cum_seq_lens_q=cum_seq_lens_q,
-            max_q_len=max_q_len,
         )
-        return out_padded if out_padded is not None else out
+        return out_padded
 
 
 class DeepseekV4TrtllmMultiStepBackend(
